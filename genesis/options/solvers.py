@@ -722,13 +722,17 @@ class PBDOptions(Options):
     max_stretch_solver_iterations : int, optional
         Maximum number of iterations for the solving stretch constraints. Defaults to 4.
     max_bending_solver_iterations : int, optional
-        Maximum number of iterations for the solving bending constraints. Defaults to 1.
+        Maximum number of iterations for the solving bending constraints. Set to 0 to disable bending. Defaults to 1.
     max_volume_solver_iterations : int, optional
         Maximum number of iterations for the solving volume constraints. Defaults to 1.
     max_density_solver_iterations : int, optional
         Maximum number of iterations for the solving density constraints. Defaults to 1.
     max_viscosity_solver_iterations : int, optional
         Maximum number of iterations for the solving viscosity constraints. Defaults to 1.
+    enable_self_collision : bool, optional
+        Whether to enable particle-particle collision constraints. Defaults to True.
+    enable_rigid_friction : bool, optional
+        Whether to apply tangential friction in PBD-rigid coupling. Defaults to False.
     particle_size : float, optional
         Particle diameter in meters. Defaults to 1e-2.
     hash_grid_res : tuple, optional
@@ -746,12 +750,14 @@ class PBDOptions(Options):
 
     # constraints solving iterations
     max_stretch_solver_iterations: PositiveInt = 4
-    max_bending_solver_iterations: PositiveInt = 1
+    max_bending_solver_iterations: NonNegativeInt = 1
     max_volume_solver_iterations: PositiveInt = 1
     max_density_solver_iterations: PositiveInt = 1
     max_viscosity_solver_iterations: PositiveInt = 1
 
     # self collision
+    enable_self_collision: StrictBool = True
+    enable_rigid_friction: StrictBool = False
     particle_size: PositiveFloat = 1e-2
 
     # spatial hashing

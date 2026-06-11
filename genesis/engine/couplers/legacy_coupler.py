@@ -895,25 +895,38 @@ class LegacyCoupler(RBC):
         if signed_dist < self.pbd_solver.particle_size / 2:  # skip non-penetration particles
             stiffness = 1.0  # value in [0, 1]
 
-            # we don't consider friction for now
-            # friction = 0.15
-            # vel_rigid = self.rigid_solver._func_vel_at_point(
-            #     pos_world=pos_world,
-            #     link_idx=geoms_info.link_idx[geom_idx],
-            #     i_b=batch_idx,
-            #     links_state=links_state,
-            # )
-            # rvel = vel - vel_rigid
-            # rvel_normal_magnitude = rvel.dot(contact_normal)  # negative if inward
-            # rvel_tan = rvel - rvel_normal_magnitude * contact_normal
-            # rvel_tan_norm = rvel_tan.norm(gs.EPS)
-
             #################### rigid -> particle ####################
 
             energy_loss = 0.0  # value in [0, 1]
-            new_pos = pos_world + stiffness * contact_normal * (self.pbd_solver.particle_size / 2 - signed_dist)
+            penetration_depth = self.pbd_solver.particle_size / 2 - signed_dist
+            new_pos = pos_world + stiffness * contact_normal * penetration_depth
             prev_pos = self.pbd_solver.particles_reordered[i, batch_idx].ipos
             new_vel = (new_pos - prev_pos) / self.pbd_solver._substep_dt
+
+            if qd.static(self.pbd_solver._enable_rigid_friction):
+                vel_rigid = self.rigid_solver._func_vel_at_point(
+                    pos_world=pos_world,
+                    link_idx=geoms_info.link_idx[geom_idx],
+                    i_b=batch_idx,
+                    links_state=links_state,
+                )
+                rvel = new_vel - vel_rigid
+                rvel_normal_magnitude = rvel.dot(contact_normal)
+                rvel_tan = rvel - rvel_normal_magnitude * contact_normal
+                rvel_tan_norm = rvel_tan.norm(gs.EPS)
+
+                normal_speed = stiffness * penetration_depth / self.pbd_solver._substep_dt
+                mu_s = qd.max(
+                    self.pbd_solver.particles_info_reordered[i, batch_idx].mu_s, geoms_info.coup_friction[geom_idx]
+                )
+                mu_k = qd.max(
+                    self.pbd_solver.particles_info_reordered[i, batch_idx].mu_k, geoms_info.coup_friction[geom_idx]
+                )
+                if rvel_tan_norm < mu_s * normal_speed:
+                    rvel_tan.fill(0.0)
+                else:
+                    rvel_tan = rvel_tan / rvel_tan_norm * qd.max(0.0, rvel_tan_norm - mu_k * normal_speed)
+                new_vel = new_vel + rvel_tan - (rvel - rvel_normal_magnitude * contact_normal)
 
             #################### particle -> rigid ####################
             delta_mv = mass * (new_vel - vel)

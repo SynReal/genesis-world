@@ -48,6 +48,8 @@ class PBDSolver(Solver):
         self._max_volume_solver_iterations = options.max_volume_solver_iterations
         self._max_density_solver_iterations = options.max_density_solver_iterations
         self._max_viscosity_solver_iterations = options.max_viscosity_solver_iterations
+        self._enable_self_collision = options.enable_self_collision
+        self._enable_rigid_friction = options.enable_rigid_friction
 
         self._n_vvert_supports = self.scene.vis_options.n_support_neighbors
 
@@ -767,7 +769,7 @@ class PBDSolver(Solver):
             if self._n_edges > 0:
                 self._kernel_solve_stretch(f)
 
-            if self._n_inner_edges > 0:
+            if self._n_inner_edges > 0 and self._max_bending_solver_iterations > 0:
                 self._kernel_solve_bending(f)
 
             if self._n_elems > 0:
@@ -777,11 +779,12 @@ class PBDSolver(Solver):
             self._kernel_reorder_particles(f)
 
             # spatial constraints
-            if self._n_particles > 0:
+            if self._n_fluid_particles > 0:
                 self._kernel_solve_density(f)
                 self._kernel_solve_viscosity(f)
 
-            self._kernel_solve_collision(f)
+            if self._enable_self_collision:
+                self._kernel_solve_collision(f)
 
             # compute effective velocity
             self._kernel_compute_velocity(f)
