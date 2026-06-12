@@ -66,8 +66,8 @@ def get_cfgs():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="g1-trampoline")
-    parser.add_argument("-B", "--num_envs", type=int, default=128)
-    parser.add_argument("--max_iterations", type=int, default=1200)
+    parser.add_argument("-B", "--num_envs", type=int, default=256)
+    parser.add_argument("--max_iterations", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     args = parser.parse_args()

@@ -72,6 +72,9 @@ dependencies = [
     "fast_simplification>=0.1.12",
     # Surface reconstruction library for particle data from SPH simulations
     "pysplashsurf==0.14.*",
+    # Used by reinforcement learning examples.
+    "rsl-rl-lib>=5.0.0",
+    "tensorboard",
 ]
 
 [project.optional-dependencies]
@@ -94,9 +97,6 @@ dev = [
     #   which requires setting the disableflags 'mjDSBL_ISLAND'.
     # * Mujoco 3.5.0 fixed computation of link invweight when degenerated.
     "mujoco>=3.5.0,<3.7.0",
-    # Used internally by 'MPLPlotter'
-    # * 3.7.0: introduces Button blitting and 'outside' keyword legend location
-    "matplotlib>=3.7.0",
     # Used internally by 'VideoFileWriter'
     "av",
     # Used for ground truth validation in unit tests

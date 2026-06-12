@@ -13,11 +13,6 @@ from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transfo
 ASSET_DIR = Path(__file__).resolve().parents[2] / "genesis" / "assets" / "xml" / "unitree_g1"
 
 
-def gs_rand(lower, upper, shape):
-    assert lower.shape == upper.shape
-    return (upper - lower) * torch.rand((*shape, *lower.shape), dtype=gs.tc_float, device=gs.device) + lower
-
-
 def _read_obj_vertices(path):
     verts = []
     with open(path, encoding="utf-8") as f:
@@ -26,6 +21,15 @@ def _read_obj_vertices(path):
                 _, x, y, z, *_ = line.split()
                 verts.append((float(x), float(y), float(z)))
     return torch.tensor(verts, dtype=gs.tc_float, device=gs.device)
+
+
+def _read_mjcf_joint_ranges(path):
+    tree = ET.parse(path)
+    ranges = {}
+    for joint in tree.getroot().findall(".//joint[@name][@range]"):
+        lower, upper = joint.attrib["range"].split()
+        ranges[joint.attrib["name"]] = (float(lower), float(upper))
+    return ranges
 
 
 def _single_mesh_obj(path):
@@ -116,6 +120,7 @@ class G1TrampolineEnv:
         env_cfg = dict(env_cfg)
         env_cfg.setdefault("trampoline_self_collision", False)
         env_cfg.setdefault("trampoline_rigid_friction", True)
+        env_cfg.setdefault("control_decimation", 1)
         env_cfg["pbd_bending_iterations"] = 0
 
         self.num_envs = num_envs
@@ -127,7 +132,9 @@ class G1TrampolineEnv:
         self.command_cfg = command_cfg
         self.device = gs.device
 
-        self.dt = env_cfg["dt"]
+        self.sim_dt = env_cfg["dt"]
+        self.control_decimation = env_cfg["control_decimation"]
+        self.dt = self.sim_dt * self.control_decimation
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
         self.simulate_action_latency = env_cfg["simulate_action_latency"]
         self.obs_scales = obs_cfg["obs_scales"]
@@ -153,7 +160,7 @@ class G1TrampolineEnv:
 
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
-                dt=self.dt,
+                dt=self.sim_dt,
                 substeps=env_cfg["substeps"],
                 gravity=(0.0, 0.0, -9.81),
             ),
@@ -238,11 +245,17 @@ class G1TrampolineEnv:
             coup_softness=env_cfg["robot_coup_softness"],
             coup_links=env_cfg["robot_coup_links"] if robot_needs_coup else None,
         )
+        robot_mjcf_path = ASSET_DIR / env_cfg["robot_mjcf"]
+        robot_file = (
+            str(_trampoline_contact_mjcf(robot_mjcf_path, env_cfg["robot_foot_radius"]))
+            if env_cfg["use_trampoline_contact_mjcf"]
+            else env_cfg["robot_mjcf"]
+        )
+        self.robot_joint_ranges = _read_mjcf_joint_ranges(robot_mjcf_path)
+
         self.robot = self.scene.add_entity(
             morph=gs.morphs.MJCF(
-                file=str(_trampoline_contact_mjcf(ASSET_DIR / env_cfg["robot_mjcf"], env_cfg["robot_foot_radius"]))
-                if env_cfg["use_trampoline_contact_mjcf"]
-                else env_cfg["robot_mjcf"],
+                file=robot_file,
                 pos=base_init_pos,
                 quat=env_cfg["base_init_quat"],
             ),
@@ -281,18 +294,47 @@ class G1TrampolineEnv:
         )
         self.all_actuated_dof_idx = torch.cat((self.motors_dof_idx, self.locked_dof_idx))
         self.actions_dof_idx = torch.argsort(self.motors_dof_idx)
+        self.feet_link_idx = torch.tensor(
+            [self.robot.get_link(name).idx_local for name in env_cfg["feet_link_names"]],
+            dtype=gs.tc_int,
+            device=gs.device,
+        )
 
-        self.robot.set_dofs_kp([env_cfg["kp"]] * self.num_actions, self.motors_dof_idx)
-        self.robot.set_dofs_kv([env_cfg["kd"]] * self.num_actions, self.motors_dof_idx)
+        kp = self._get_joint_cfg_values("kp")
+        kd = self._get_joint_cfg_values("kd")
+        self.robot.set_dofs_kp(kp, self.motors_dof_idx)
+        self.robot.set_dofs_kv(kd, self.motors_dof_idx)
         if len(self.locked_dof_idx) > 0:
-            self.robot.set_dofs_kp([env_cfg["lock_kp"]] * len(self.locked_dof_idx), self.locked_dof_idx)
-            self.robot.set_dofs_kv([env_cfg["lock_kd"]] * len(self.locked_dof_idx), self.locked_dof_idx)
+            lock_kp = self._get_joint_cfg_values("lock_kp", env_cfg["locked_joint_names"])
+            lock_kd = self._get_joint_cfg_values("lock_kd", env_cfg["locked_joint_names"])
+            self.robot.set_dofs_kp(lock_kp, self.locked_dof_idx)
+            self.robot.set_dofs_kv(lock_kd, self.locked_dof_idx)
 
         self.default_dof_pos = torch.tensor(
             [env_cfg["default_joint_angles"][name] for name in env_cfg["joint_names"]],
             dtype=gs.tc_float,
             device=gs.device,
         )
+        action_scales = env_cfg.get("action_scales")
+        if action_scales is None and env_cfg.get("action_scale_from_joint_limits", False):
+            action_scales = self._get_action_scales_from_joint_limits()
+        if action_scales is None:
+            action_scales = env_cfg["action_scale"]
+        if isinstance(action_scales, dict):
+            action_scales = [action_scales[name] for name in env_cfg["joint_names"]]
+        self.action_scales = torch.as_tensor(action_scales, dtype=gs.tc_float, device=gs.device)
+        if self.action_scales.ndim == 0:
+            self.action_scales = self.action_scales.repeat(self.num_actions)
+        if self.action_scales.shape != (self.num_actions,):
+            raise ValueError(f"action_scales must have shape ({self.num_actions},), got {tuple(self.action_scales.shape)}")
+        self.reward_dof_weights = {
+            name: torch.tensor(
+                self._get_joint_cfg_values(name, env_cfg["joint_names"]),
+                dtype=gs.tc_float,
+                device=gs.device,
+            )
+            for name in ("action_rate_weights", "dof_vel_weights", "similar_to_default_weights")
+        }
         self.locked_default_dof_pos = torch.tensor(
             [env_cfg["default_joint_angles"][name] for name in env_cfg["locked_joint_names"]],
             dtype=gs.tc_float,
@@ -319,13 +361,13 @@ class G1TrampolineEnv:
         self.base_lin_vel = torch.empty((num_envs, 3), dtype=gs.tc_float, device=gs.device)
         self.base_ang_vel = torch.empty((num_envs, 3), dtype=gs.tc_float, device=gs.device)
         self.projected_gravity = torch.empty((num_envs, 3), dtype=gs.tc_float, device=gs.device)
+        self.feet_pos = torch.empty((num_envs, len(env_cfg["feet_link_names"]), 3), dtype=gs.tc_float, device=gs.device)
+        self.feet_cloth_obs = torch.zeros((num_envs, 4), dtype=gs.tc_float, device=gs.device)
         self.dof_pos = torch.empty((num_envs, self.num_actions), dtype=gs.tc_float, device=gs.device)
         self.dof_vel = torch.empty((num_envs, self.num_actions), dtype=gs.tc_float, device=gs.device)
         self.last_dof_vel = torch.zeros_like(self.dof_vel)
         self.actions = torch.zeros((num_envs, self.num_actions), dtype=gs.tc_float, device=gs.device)
         self.last_actions = torch.zeros_like(self.actions)
-        self.phase = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
-        self.commands = torch.zeros((num_envs, command_cfg["num_commands"]), dtype=gs.tc_float, device=gs.device)
         self.rew_buf = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
         self.reset_buf = torch.ones((num_envs,), dtype=gs.tc_bool, device=gs.device)
         self.episode_length_buf = torch.zeros((num_envs,), dtype=gs.tc_int, device=gs.device)
@@ -342,6 +384,26 @@ class G1TrampolineEnv:
             self.episode_sums[name] = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
 
         self.reset()
+
+    def _get_joint_cfg_values(self, name, joint_names=None):
+        if joint_names is None:
+            joint_names = self.env_cfg["joint_names"]
+        value = self.env_cfg[name]
+        if isinstance(value, dict):
+            return [value[joint_name] for joint_name in joint_names]
+        return [value] * len(joint_names)
+
+    def _get_action_scales_from_joint_limits(self):
+        scales = []
+        safety = self.env_cfg["action_scale_safety"]
+        limits = self.env_cfg.get("action_scale_limits", {})
+        for joint_name in self.env_cfg["joint_names"]:
+            lower, upper = self.robot_joint_ranges[joint_name]
+            default = self.env_cfg["default_joint_angles"][joint_name]
+            scale = safety * min(default - lower, upper - default)
+            scale = min(scale, limits.get(joint_name, float("inf")))
+            scales.append(scale)
+        return scales
 
     def _fix_trampoline_outer_ring(self):
         particles = self.trampoline.get_particles_pos()
@@ -362,26 +424,16 @@ class G1TrampolineEnv:
         fixed_idx = torch.tensor(self.trampoline_fixed_particles, dtype=gs.tc_int, device=gs.device)
         self.trampoline.fix_particles(fixed_idx)
 
-    def _resample_commands(self, envs_idx=None):
-        period = gs_rand(
-            torch.tensor(self.command_cfg["period_range"][0], dtype=gs.tc_float, device=gs.device),
-            torch.tensor(self.command_cfg["period_range"][1], dtype=gs.tc_float, device=gs.device),
-            (self.num_envs,),
-        )
-        if envs_idx is None:
-            self.commands[:, 0] = period
-        else:
-            self.commands[:, 0] = torch.where(envs_idx, period, self.commands[:, 0])
-
     def step(self, actions):
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
-        target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
+        target_dof_pos = exec_actions * self.action_scales + self.default_dof_pos
         self.robot.control_dofs_position(target_dof_pos[:, self.actions_dof_idx], self.motors_dof_idx)
         if len(self.locked_dof_idx) > 0:
             self.robot.control_dofs_position(self.locked_default_dof_pos.expand(self.num_envs, -1), self.locked_dof_idx)
 
-        self.scene.step()
+        for _ in range(self.control_decimation):
+            self.scene.step()
 
         self.episode_length_buf += 1
         self._refresh_state()
@@ -398,7 +450,6 @@ class G1TrampolineEnv:
             self.rew_buf += rew
             self.episode_sums[name] += rew
 
-        self._resample_commands(self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
         self.reset_buf = self.episode_length_buf > self.max_episode_length
         self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
         self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
@@ -426,11 +477,29 @@ class G1TrampolineEnv:
         self.base_lin_vel = transform_by_quat(self.robot.get_vel(), inv_base_quat)
         self.base_ang_vel = transform_by_quat(self.robot.get_ang(), inv_base_quat)
         self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
+        self.feet_pos = self.robot.get_links_pos(self.feet_link_idx)
+        self._refresh_feet_cloth_obs()
         self.dof_pos = self.robot.get_dofs_position(self.motors_dof_idx)
         self.dof_vel = self.robot.get_dofs_velocity(self.motors_dof_idx)
-        phase_angle = 2.0 * math.pi * self.episode_length_buf.to(gs.tc_float) * self.dt / self.commands[:, 0]
-        self.phase[:, 0] = torch.sin(phase_angle)
-        self.phase[:, 1] = torch.cos(phase_angle)
+    def _refresh_feet_cloth_obs(self):
+        particles_pos = self.trampoline.get_particles_pos()
+        particles_vel = self.trampoline.get_particles_vel()
+        foot_xy = self.feet_pos[..., :2]
+        delta_xy = particles_pos[:, None, :, :2] - foot_xy[:, :, None, :]
+        dist2 = torch.sum(torch.square(delta_xy), dim=-1)
+        radius = self.env_cfg["feet_cloth_obs_radius"]
+        weights = torch.exp(-dist2 / max(radius * radius, gs.EPS))
+        weights = weights / torch.clamp(weights.sum(dim=-1, keepdim=True), min=gs.EPS)
+        cloth_z = torch.sum(weights * particles_pos[:, None, :, 2], dim=-1)
+        cloth_vz = torch.sum(weights * particles_vel[:, None, :, 2], dim=-1)
+        rel_height = self.feet_pos[..., 2] - cloth_z
+        self.feet_cloth_obs = torch.cat(
+            (
+                rel_height * self.obs_scales["feet_cloth_height"],
+                cloth_vz * self.obs_scales["feet_cloth_vel_z"],
+            ),
+            dim=-1,
+        )
 
     def get_observations(self):
         return TensorDict({"policy": self.obs_buf}, batch_size=[self.num_envs])
@@ -491,17 +560,15 @@ class G1TrampolineEnv:
                 value.zero_()
             else:
                 value.masked_fill_(envs_idx, 0.0)
-        self._resample_commands(envs_idx)
-
     def _update_observation(self):
         self.obs_buf = torch.cat(
             (
                 self.base_ang_vel * self.obs_scales["ang_vel"],
                 self.projected_gravity,
-                self.phase,
                 (self.base_pos[:, 2:3] - self.base_height_ref) * self.obs_scales["height"],
                 self.base_lin_vel[:, 2:3] * self.obs_scales["lin_vel_z"],
                 self.base_pos[:, :2] * self.obs_scales["xy"],
+                self.feet_cloth_obs,
                 (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
                 self.dof_vel * self.obs_scales["dof_vel"],
                 self.actions,
@@ -525,7 +592,7 @@ class G1TrampolineEnv:
         return up * near_apex
 
     def _reward_vertical_velocity(self):
-        desired = self.reward_cfg["takeoff_vel"] * torch.clamp(self.phase[:, 0], min=0.0)
+        desired = self.reward_cfg["takeoff_vel"]
         return torch.exp(-torch.square((self.base_lin_vel[:, 2] - desired) / self.reward_cfg["vel_tracking_sigma"]))
 
     def _reward_centering(self):
@@ -535,13 +602,19 @@ class G1TrampolineEnv:
         return torch.sum(torch.square(self.projected_gravity[:, :2]), dim=-1)
 
     def _reward_action_rate(self):
-        return torch.sum(torch.square(self.actions - self.last_actions), dim=-1)
+        return torch.sum(
+            self.reward_dof_weights["action_rate_weights"] * torch.square(self.actions - self.last_actions),
+            dim=-1,
+        )
 
     def _reward_dof_acc(self):
         return torch.sum(torch.square((self.dof_vel - self.last_dof_vel) / self.dt), dim=-1)
 
     def _reward_similar_to_default(self):
-        return torch.sum(torch.square(self.dof_pos - self.default_dof_pos), dim=-1)
+        return torch.sum(
+            self.reward_dof_weights["similar_to_default_weights"] * torch.square(self.dof_pos - self.default_dof_pos),
+            dim=-1,
+        )
 
     def _reward_alive(self):
         return torch.ones((self.num_envs,), dtype=gs.tc_float, device=gs.device)
@@ -561,7 +634,7 @@ class G1TrampolineEnv:
         return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=-1)
 
     def _reward_dof_vel(self):
-        return torch.sum(torch.square(self.dof_vel), dim=-1)
+        return torch.sum(self.reward_dof_weights["dof_vel_weights"] * torch.square(self.dof_vel), dim=-1)
 
 
 def get_default_cfgs():
@@ -630,14 +703,48 @@ def get_default_cfgs():
         "right_wrist_yaw_joint": 0.0,
     }
     env_cfg = {
-        "num_actions": 12,
+        "num_actions": len(leg_joints) + len(upper_joints),
         "dt": 0.005,
+        "control_decimation": 4,
         "substeps": 10,
         "episode_length_s": 8.0,
-        "resampling_time_s": 2.0,
         "simulate_action_latency": True,
         "clip_actions": 1.0,
         "action_scale": 0.45,
+        "action_scales": None,
+        "action_scale_from_joint_limits": True,
+        "action_scale_safety": 0.8,
+        "action_scale_limits": {
+            "left_hip_pitch_joint": 0.60,
+            "left_hip_roll_joint": 0.35,
+            "left_hip_yaw_joint": 0.35,
+            "left_knee_joint": 0.50,
+            "left_ankle_pitch_joint": 0.30,
+            "left_ankle_roll_joint": 0.18,
+            "right_hip_pitch_joint": 0.60,
+            "right_hip_roll_joint": 0.35,
+            "right_hip_yaw_joint": 0.35,
+            "right_knee_joint": 0.50,
+            "right_ankle_pitch_joint": 0.30,
+            "right_ankle_roll_joint": 0.18,
+            "waist_yaw_joint": 0.35,
+            "waist_roll_joint": 0.25,
+            "waist_pitch_joint": 0.25,
+            "left_shoulder_pitch_joint": 0.50,
+            "left_shoulder_roll_joint": 0.45,
+            "left_shoulder_yaw_joint": 0.45,
+            "left_elbow_joint": 0.45,
+            "left_wrist_roll_joint": 0.35,
+            "left_wrist_pitch_joint": 0.25,
+            "left_wrist_yaw_joint": 0.25,
+            "right_shoulder_pitch_joint": 0.50,
+            "right_shoulder_roll_joint": 0.45,
+            "right_shoulder_yaw_joint": 0.45,
+            "right_elbow_joint": 0.45,
+            "right_wrist_roll_joint": 0.35,
+            "right_wrist_pitch_joint": 0.25,
+            "right_wrist_yaw_joint": 0.25,
+        },
         "base_init_pos": [0.0, 0.0, 0.79],
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
         "base_init_pos_relative_to_trampoline": True,
@@ -646,13 +753,156 @@ def get_default_cfgs():
         "use_trampoline_contact_mjcf": True,
         "robot_friction": 1.4,
         "robot_foot_radius": 0.025,
-        "joint_names": leg_joints,
-        "locked_joint_names": upper_joints,
+        "feet_link_names": ("left_ankle_roll_link", "right_ankle_roll_link"),
+        "feet_cloth_obs_radius": 0.12,
+        "joint_names": leg_joints + upper_joints,
+        "locked_joint_names": [],
         "default_joint_angles": default_joint_angles,
-        "kp": 500.0,
-        "kd": 1.0,
-        "lock_kp": 55.0,
-        "lock_kd": 3.0,
+        "kp": {
+            "left_hip_pitch_joint": 75.0,
+            "left_hip_roll_joint": 75.0,
+            "left_hip_yaw_joint": 75.0,
+            "left_knee_joint": 75.0,
+            "left_ankle_pitch_joint": 20.0,
+            "left_ankle_roll_joint": 20.0,
+            "right_hip_pitch_joint": 75.0,
+            "right_hip_roll_joint": 75.0,
+            "right_hip_yaw_joint": 75.0,
+            "right_knee_joint": 75.0,
+            "right_ankle_pitch_joint": 20.0,
+            "right_ankle_roll_joint": 20.0,
+            "waist_yaw_joint": 75.0,
+            "waist_roll_joint": 75.0,
+            "waist_pitch_joint": 75.0,
+            "left_shoulder_pitch_joint": 75.0,
+            "left_shoulder_roll_joint": 75.0,
+            "left_shoulder_yaw_joint": 75.0,
+            "left_elbow_joint": 75.0,
+            "left_wrist_roll_joint": 20.0,
+            "left_wrist_pitch_joint": 20.0,
+            "left_wrist_yaw_joint": 20.0,
+            "right_shoulder_pitch_joint": 75.0,
+            "right_shoulder_roll_joint": 75.0,
+            "right_shoulder_yaw_joint": 75.0,
+            "right_elbow_joint": 75.0,
+            "right_wrist_roll_joint": 20.0,
+            "right_wrist_pitch_joint": 20.0,
+            "right_wrist_yaw_joint": 20.0,
+        },
+        "kd": 2.0,
+        "action_rate_weights": {
+            "left_hip_pitch_joint": 1.0,
+            "left_hip_roll_joint": 1.0,
+            "left_hip_yaw_joint": 1.0,
+            "left_knee_joint": 1.0,
+            "left_ankle_pitch_joint": 1.0,
+            "left_ankle_roll_joint": 1.0,
+            "right_hip_pitch_joint": 1.0,
+            "right_hip_roll_joint": 1.0,
+            "right_hip_yaw_joint": 1.0,
+            "right_knee_joint": 1.0,
+            "right_ankle_pitch_joint": 1.0,
+            "right_ankle_roll_joint": 1.0,
+            "waist_yaw_joint": 2.0,
+            "waist_roll_joint": 2.0,
+            "waist_pitch_joint": 2.0,
+            "left_shoulder_pitch_joint": 4.0,
+            "left_shoulder_roll_joint": 4.0,
+            "left_shoulder_yaw_joint": 4.0,
+            "left_elbow_joint": 4.0,
+            "left_wrist_roll_joint": 4.0,
+            "left_wrist_pitch_joint": 4.0,
+            "left_wrist_yaw_joint": 4.0,
+            "right_shoulder_pitch_joint": 4.0,
+            "right_shoulder_roll_joint": 4.0,
+            "right_shoulder_yaw_joint": 4.0,
+            "right_elbow_joint": 4.0,
+            "right_wrist_roll_joint": 4.0,
+            "right_wrist_pitch_joint": 4.0,
+            "right_wrist_yaw_joint": 4.0,
+        },
+        "dof_vel_weights": {
+            "left_hip_pitch_joint": 1.0,
+            "left_hip_roll_joint": 1.0,
+            "left_hip_yaw_joint": 1.0,
+            "left_knee_joint": 1.0,
+            "left_ankle_pitch_joint": 1.0,
+            "left_ankle_roll_joint": 1.0,
+            "right_hip_pitch_joint": 1.0,
+            "right_hip_roll_joint": 1.0,
+            "right_hip_yaw_joint": 1.0,
+            "right_knee_joint": 1.0,
+            "right_ankle_pitch_joint": 1.0,
+            "right_ankle_roll_joint": 1.0,
+            "waist_yaw_joint": 2.0,
+            "waist_roll_joint": 2.0,
+            "waist_pitch_joint": 2.0,
+            "left_shoulder_pitch_joint": 3.0,
+            "left_shoulder_roll_joint": 3.0,
+            "left_shoulder_yaw_joint": 3.0,
+            "left_elbow_joint": 3.0,
+            "left_wrist_roll_joint": 3.0,
+            "left_wrist_pitch_joint": 3.0,
+            "left_wrist_yaw_joint": 3.0,
+            "right_shoulder_pitch_joint": 3.0,
+            "right_shoulder_roll_joint": 3.0,
+            "right_shoulder_yaw_joint": 3.0,
+            "right_elbow_joint": 3.0,
+            "right_wrist_roll_joint": 3.0,
+            "right_wrist_pitch_joint": 3.0,
+            "right_wrist_yaw_joint": 3.0,
+        },
+        "similar_to_default_weights": {
+            "left_hip_pitch_joint": 1.0,
+            "left_hip_roll_joint": 1.0,
+            "left_hip_yaw_joint": 1.0,
+            "left_knee_joint": 1.0,
+            "left_ankle_pitch_joint": 1.0,
+            "left_ankle_roll_joint": 1.0,
+            "right_hip_pitch_joint": 1.0,
+            "right_hip_roll_joint": 1.0,
+            "right_hip_yaw_joint": 1.0,
+            "right_knee_joint": 1.0,
+            "right_ankle_pitch_joint": 1.0,
+            "right_ankle_roll_joint": 1.0,
+            "waist_yaw_joint": 3.0,
+            "waist_roll_joint": 3.0,
+            "waist_pitch_joint": 3.0,
+            "left_shoulder_pitch_joint": 5.0,
+            "left_shoulder_roll_joint": 5.0,
+            "left_shoulder_yaw_joint": 5.0,
+            "left_elbow_joint": 5.0,
+            "left_wrist_roll_joint": 5.0,
+            "left_wrist_pitch_joint": 5.0,
+            "left_wrist_yaw_joint": 5.0,
+            "right_shoulder_pitch_joint": 5.0,
+            "right_shoulder_roll_joint": 5.0,
+            "right_shoulder_yaw_joint": 5.0,
+            "right_elbow_joint": 5.0,
+            "right_wrist_roll_joint": 5.0,
+            "right_wrist_pitch_joint": 5.0,
+            "right_wrist_yaw_joint": 5.0,
+        },
+        "lock_kp": {
+            "waist_yaw_joint": 75.0,
+            "waist_roll_joint": 75.0,
+            "waist_pitch_joint": 75.0,
+            "left_shoulder_pitch_joint": 75.0,
+            "left_shoulder_roll_joint": 75.0,
+            "left_shoulder_yaw_joint": 75.0,
+            "left_elbow_joint": 75.0,
+            "left_wrist_roll_joint": 20.0,
+            "left_wrist_pitch_joint": 20.0,
+            "left_wrist_yaw_joint": 20.0,
+            "right_shoulder_pitch_joint": 75.0,
+            "right_shoulder_roll_joint": 75.0,
+            "right_shoulder_yaw_joint": 75.0,
+            "right_elbow_joint": 75.0,
+            "right_wrist_roll_joint": 20.0,
+            "right_wrist_pitch_joint": 20.0,
+            "right_wrist_yaw_joint": 20.0,
+        },
+        "lock_kd": 2.0,
         "termination_if_roll_greater_than": 25.0,
         "termination_if_pitch_greater_than": 25.0,
         "termination_if_xy_greater_than": 0.45,
@@ -708,6 +958,8 @@ def get_default_cfgs():
             "height": 5.0,
             "lin_vel_z": 0.4,
             "xy": 2.0,
+            "feet_cloth_height": 5.0,
+            "feet_cloth_vel_z": 0.5,
             "dof_pos": 1.0,
             "dof_vel": 0.05,
         },
@@ -729,16 +981,13 @@ def get_default_cfgs():
             "lin_vel_xy": -1.5,
             "lin_vel_z": -2.0,
             "ang_vel_xy": -0.4,
-            "action_rate": -0.08,
-            "dof_vel": -0.002,
+            "action_rate": -0.04,
+            "dof_vel": -0.001,
             "dof_acc": -1.0e-7,
-            "similar_to_default": -0.08,
+            "similar_to_default": -0.04,
         },
     }
-    command_cfg = {
-        "num_commands": 1,
-        "period_range": [1000.0, 1000.0],
-    }
+    command_cfg = {}
     return env_cfg, obs_cfg, reward_cfg, command_cfg
 
 
