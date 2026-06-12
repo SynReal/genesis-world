@@ -1,3 +1,5 @@
+> 本地修改说明见 [README_NEW.md](./README_NEW.md)。
+
 ![Genesis World teaser](https://raw.githubusercontent.com/YilingQiao/Genesis/readme-assets/videos/HeroShot_Final.png)
 
 # Genesis World
