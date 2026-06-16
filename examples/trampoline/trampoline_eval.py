@@ -20,7 +20,7 @@ from trampoline_env import G1TrampolineEnv
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="g1-trampoline")
-    parser.add_argument("--ckpt", type=int, default=1199)
+    parser.add_argument("--ckpt", type=int, default=3000)
     parser.add_argument("--cpu", action="store_true", default=False)
     parser.add_argument("--no-viewer", action="store_true", default=False)
     parser.add_argument("--num_steps", type=int)
@@ -41,6 +41,7 @@ def main():
         command_cfg=command_cfg,
         show_viewer=not args.no_viewer,
     )
+    env.max_episode_length = float("inf")
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
     runner.load(os.path.join(log_dir, f"model_{args.ckpt}.pt"))
     policy = runner.get_inference_policy(device=gs.device)
